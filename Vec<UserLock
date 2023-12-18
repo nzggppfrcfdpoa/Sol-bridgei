@@ -1,0 +1,180 @@
+// Import necessary libraries
+use solana_program::{
+    account_info::AccountInfo, entrypoint, entrypoint::ProgramResult, msg, pubkey::Pubkey, program,
+    program_pack::Pack, system_instruction,
+};
+
+// Define contract data structure
+#[repr(C)]
+pub struct SolanaLock {
+    pub owner: Pubkey,
+    pub user_locks: Vec<UserLock>,
+}
+
+// Define user lock data structure
+#[repr(C)]
+pub struct UserLock {
+    pub user: Pubkey,
+    pub amount: u64,
+}
+
+// Program entry point
+#[entrypoint]
+fn process_instruction(program_id: &Pubkey, accounts: &[AccountInfo], instruction_data: &[u8]) -> ProgramResult {
+    // Parse account information
+    let accounts_iter = &mut accounts.iter();
+    let solana_lock_account = next_account_info(accounts_iter)?;
+
+    // Check if the correct program owns the contract
+    if solana_lock_account.owner != program_id {
+        return Err(solana_program::program_error::ProgramError::IncorrectProgramId);
+    }
+
+    // Parse contract data
+    let mut solana_lock_data = SolanaLock::unpack(&solana_lock_account.data.borrow())?;
+
+    // Handle different operations based on the instruction
+    match instruction_data[0] {
+        0 => {
+            // Operation: Lock funds
+            lock_funds(accounts_iter, &mut solana_lock_data, instruction_data)?;
+        }
+        1 => {
+            // Operation: Unlock funds (partial)
+            unlock_funds(accounts_iter, &mut solana_lock_data, instruction_data)?;
+        }
+        _ => {
+            // Invalid operation
+            return Err(solana_program::program_error::ProgramError::InvalidInstructionData);
+        }
+    }
+
+    // Update contract data
+    SolanaLock::pack(solana_lock_data, &mut solana_lock_account.data.borrow_mut())?;
+
+    Ok(())
+}
+
+// Helper function: Lock funds in Solana
+fn lock_funds<'a, 'b>(
+    accounts_iter: &mut impl Iterator<Item = &'a AccountInfo<'b>>,
+    solana_lock_data: &mut SolanaLock,
+    instruction_data: &[u8],
+) -> ProgramResult {
+    let user_account = next_account_info(accounts_iter)?;
+    let amount = u64::from_le_bytes(instruction_data[1..9].try_into().unwrap());
+
+    // Check if the user provided enough funds
+    let user_token_account = next_account_info(accounts_iter)?;
+    let token_balance = user_token_account.try_borrow_data()?;
+    let user_balance = u64::from_le_bytes(token_balance[0..8].try_into().unwrap());
+
+    if user_balance < amount {
+        return Err(solana_program::program_error::ProgramError::InsufficientFunds);
+    }
+
+    // Transfer funds to the contract account
+    let transfer_ix = solana_program::system_instruction::transfer(user_account.key, &solana_lock_account.key, amount);
+    solana_program::program::invoke(&[transfer_ix], accounts_iter)?;
+
+    // Update contract data
+    let user_lock = UserLock {
+        user: *user_account.key,
+        amount,
+    };
+    solana_lock_data.user_locks.push(user_lock);
+
+    Ok(())
+}
+
+// Helper function: Unlock funds (partial) in Solana
+fn unlock_funds<'a, 'b>(
+    accounts_iter: &mut impl Iterator<Item = &'a AccountInfo<'b>>,
+    solana_lock_data: &mut SolanaLock,
+    instruction_data: &[u8],
+) -> ProgramResult {
+    let user_account = next_account_info(accounts_iter)?;
+    let unlock_amount = u64::from_le_bytes(instruction_data[1..9].try_into().unwrap());
+
+    // Find the user's lock and partially unlock
+    for user_lock in solana_lock_data.user_locks.iter_mut() {
+        if user_lock.user == *user_account.key {
+            if user_lock.amount >= unlock_amount {
+                // Transfer unlocked funds back to the user
+                let transfer_ix = solana_program::system_instruction::transfer(
+                    &solana_lock_account.key,
+                    user_account.key,
+                    unlock_amount,
+                );
+                solana_program::program::invoke(&[transfer_ix], accounts_iter)?;
+
+                // Update lock amount
+                user_lock.amount -= unlock_amount;
+
+                // If the lock is empty, remove it
+                if user_lock.amount == 0 {
+                    solana_lock_data.user_locks.retain(|lock| lock.user != *user_account.key);
+                }
+
+                return Ok(());
+            } else {
+                // Attempt to unlock more than locked amount
+                return Err(solana_program::program_error::ProgramError::InvalidInstructionData);
+            }
+        }
+    }
+
+    // User's lock not found
+    Err(solana_program::program_error::ProgramError::InvalidInstructionData)
+}
+
+// Helper function: Parse account information
+fn next_account_info<'a, 'b>(
+    iter: &mut impl Iterator<Item = &'a AccountInfo<'b>>,
+) -> Result<&'a AccountInfo<'b>, ProgramResult> {
+    iter.next().ok_or_else(|| solana_program::program_error::ProgramError::NotEnoughAccountKeys)
+}
+
+// Helper function: Pack contract data into storage space
+impl Pack for SolanaLock {
+    const LEN: usize = 40;
+
+    fn unpack_from_slice(src: &[u8]) -> Result<Self, solana_program::program_error::ProgramError> {
+        let owner = Pubkey::new_from_array(<[u8; 32]>::try_from(&src[0..32]).unwrap());
+        let user_locks = unpack_array(&src[32..]);
+
+        Ok(SolanaLock { owner, user_locks })
+    }
+
+    fn pack_into_slice(&self, dst: &mut [u8]) {
+        dst[0..32].copy_from_slice(&self.owner.to_bytes());
+        pack_array(&self.user_locks, &mut dst[32..]);
+    }
+}
+
+// Helper function: Pack vector into storage space
+fn pack_array<T: Pack>(array: &Vec<T>, dst: &mut [u8]) {
+    let len_bytes = (array.len() as u64).to_le_bytes();
+    dst[0..8].copy_from_slice(&len_bytes);
+
+    let mut offset = 8;
+    for item in array {
+        item.pack_into_slice(&mut dst[offset..]);
+        offset += T::LEN;
+    }
+}
+
+// Helper function: Unpack vector from storage space
+fn unpack_array<T: Pack>(src: &[u8]) -> Vec<T> {
+    let len = u64::from_le_bytes(src[0..8].try_into().unwrap());
+    let mut result = Vec::with_capacity(len as usize);
+
+    let mut offset = 8;
+    for _ in 0..len {
+        let item = T::unpack_from_slice(&src[offset..]).unwrap();
+        result.push(item);
+        offset += T::LEN;
+    }
+
+    result
+}
